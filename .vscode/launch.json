@@ -1,0 +1,14 @@
+{
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Spring Boot-UserServiceApplication<userService>",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "mainClass": "com.flowSync.userService.UserServiceApplication",
+            "projectName": "userService",
+            "args": "",
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}
