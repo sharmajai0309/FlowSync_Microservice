@@ -1,0 +1,330 @@
+# FlowSync Auth Service — Complete Codebase Flow
+
+## Architecture Overview
+
+The **authService** is a Spring Boot microservice running on port `8083` providing JWT-based authentication. It communicates with a **User Service** (port `8082`) during registration to create user profiles.
+
+```mermaid
+graph TB
+    Client["Client / API Consumer"]
+    
+    subgraph AuthService["Auth Service :8083"]
+        SF["Spring Security Filter Chain"]
+        JF["JwtAuthenticationFilter"]
+        AC["AuthController"]
+        AS["AuthService"]
+        JS["JwtService"]
+        CUDS["CustomUserDetailsService"]
+        REPO["AuthUserRepository"]
+        GEH["GlobalExceptionHandler"]
+    end
+    
+    DB[("PostgreSQL\nFlowSync-AuthService\n:5433")]
+    US["User Service :8082"]
+
+    Client -->|HTTP Request| SF
+    SF --> JF
+    JF --> AC
+    AC --> AS
+    AS --> JS
+    AS --> REPO
+    AS -->|POST /users/internal| US
+    JF --> CUDS
+    CUDS --> REPO
+    REPO --> DB
+    AC -.->|Exceptions| GEH
+```
+
+---
+
+## Project Structure
+
+```
+src/main/java/com/flowsync/authService/
+├── AuthServiceApplication.java          # Spring Boot entry point
+├── config/
+│   ├── SecurityConfig.java              # Spring Security filter chain
+│   ├── ApplicationConfig.java           # RestTemplate bean
+│   ├── CorsConfig.java                  # CORS configuration
+│   └── RestClientConfig.java            # (commented out) RestClient config
+├── controller/
+│   └── AuthController.java              # REST endpoints
+├── Service/
+│   ├── AuthService.java                 # Core business logic
+│   └── CustomUserDetailsService.java    # UserDetailsService impl
+├── jwt/
+│   ├── JwtService.java                  # Token generation & validation
+│   └── JwtAuthenticationFilter.java     # Per-request JWT filter
+├── domain/
+│   ├── AuthUser.java                    # JPA entity + UserDetails
+│   └── UserRole.java                    # Enum: USER, MANAGER, ADMIN
+├── dto/
+│   ├── Request/
+│   │   ├── RegisterRequest.java
+│   │   └── LoginRequest.java
+│   └── Response/
+│       ├── JwtResponse.java
+│       ├── ErrorResponse.java
+│       ├── LoginResponse.java
+│       └── RegisterResponse.java
+├── client/
+│   ├── CreateUserProfileRequest.java    # DTO sent to User Service
+│   ├── UserResponse.java               # DTO received from User Service
+│   └── UserServiceClient.java          # (empty placeholder)
+├── repository/
+│   └── AuthUserRepository.java          # JPA Repository
+└── Exception/
+    ├── AbstractEntity.java              # Interface for status codes
+    ├── JwtValidationException.java      # Custom JWT exception
+    └── handler/
+        └── GlobalExceptionHandler.java  # @RestControllerAdvice
+```
+
+---
+
+## Detailed Request Flows
+
+### 1. Registration Flow — `POST /api/auth/register`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant SF as SecurityFilterChain
+    participant JF as JwtAuthenticationFilter
+    participant AC as AuthController
+    participant AS as AuthService
+    participant R as AuthUserRepository
+    participant JS as JwtService
+    participant US as User Service :8082
+    participant DB as PostgreSQL
+
+    C->>SF: POST /api/auth/register<br/>{email, firstName, lastName, password, role}
+    SF->>SF: CSRF check (should be disabled)
+    SF->>JF: Pass to JWT filter
+    JF->>JF: No "Authorization" header → skip auth
+    JF->>AC: Forward to controller
+
+    AC->>AS: register(RegisterRequest)
+    AS->>R: existsByEmail(email)
+    R->>DB: SELECT EXISTS
+    DB-->>R: true/false
+
+    alt Email already exists
+        AS-->>AC: throw IllegalArgumentException
+        AC-->>C: 400 Bad Request
+    end
+
+    AS->>AS: Generate UUID, encode password
+    AS->>R: save(AuthUser)
+    R->>DB: INSERT INTO auth_users
+    DB-->>R: OK
+
+    AS->>US: POST http://localhost:8082/users/internal<br/>{id, firstName, lastName, email}
+    US-->>AS: UserResponse
+
+    AS->>JS: generateToken(authUser)
+    JS-->>AS: JWT token
+
+    AS-->>AC: JwtResponse{token, userId, email, role}
+    AC-->>C: 201 Created + JwtResponse
+```
+
+> [!IMPORTANT]
+> The `/api/auth/**` path is configured as `permitAll()` in `SecurityConfig`, so no authentication is required for this endpoint.
+
+---
+
+### 2. Login Flow — `POST /api/auth/login`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant SF as SecurityFilterChain
+    participant JF as JwtAuthenticationFilter
+    participant AC as AuthController
+    participant AS as AuthService
+    participant AM as AuthenticationManager
+    participant CUDS as CustomUserDetailsService
+    participant R as AuthUserRepository
+    participant JS as JwtService
+    participant DB as PostgreSQL
+
+    C->>SF: POST /api/auth/login<br/>{email, password}
+    SF->>JF: No Bearer token → skip
+    JF->>AC: Forward
+
+    AC->>AS: login(LoginRequest)
+    AS->>AM: authenticate(email, password)
+    AM->>CUDS: loadUserByUsername(email)
+    CUDS->>R: findByEmail(email)
+    R->>DB: SELECT * FROM auth_users
+    DB-->>R: AuthUser
+
+    alt Credentials Invalid
+        AM-->>AS: throw BadCredentialsException
+        AS-->>C: 401 Unauthorized
+    end
+
+    AM-->>AS: Authentication (principal = AuthUser)
+    AS->>AS: authUser.updateLastLogin()
+    AS->>R: save(authUser)
+    R->>DB: UPDATE last_login
+    DB-->>R: OK
+
+    AS->>JS: generateToken(authUser)
+    JS-->>AS: JWT token
+
+    AS-->>AC: JwtResponse{token, userId, email, role}
+    AC-->>C: 200 OK + JwtResponse
+```
+
+---
+
+### 3. Token Validation Flow — `GET /api/auth/validate?token=...`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AC as AuthController
+    participant AS as AuthService
+    participant JS as JwtService
+
+    C->>AC: GET /api/auth/validate?token=xxx
+    AC->>AS: validateToken(token)
+    AS->>JS: validateToken(token)
+    JS->>JS: Parse JWT, check expiration
+    JS-->>AS: true / false
+    AS-->>AC: boolean
+    AC-->>C: 200 OK {"valid": true/false}
+```
+
+> [!NOTE]
+> This endpoint is used by **other microservices** to verify tokens issued by the auth service.
+
+---
+
+### 4. Authenticated Request Flow (Protected Endpoints)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant SF as SecurityFilterChain
+    participant JF as JwtAuthenticationFilter
+    participant JS as JwtService
+    participant CUDS as CustomUserDetailsService
+    participant R as AuthUserRepository
+    participant SC as SecurityContext
+    participant EP as Protected Endpoint
+
+    C->>SF: GET /api/some-protected-resource<br/>Authorization: Bearer <JWT>
+    SF->>JF: Enter JWT filter
+    JF->>JF: Extract token from header
+    JF->>JS: extractEmail(token)
+    JS-->>JF: user email
+    JF->>CUDS: loadUserByUsername(email)
+    CUDS->>R: findByEmail(email)
+    R-->>CUDS: AuthUser
+    CUDS-->>JF: UserDetails
+
+    JF->>JS: validateToken(token)
+    JS-->>JF: true
+
+    JF->>SC: Set Authentication
+    JF->>EP: Continue filter chain
+    EP-->>C: 200 OK + Response
+
+    alt Token Expired
+        JS-->>JF: throw ExpiredJwtException
+        JF-->>C: 401 "JWT token has expired"
+    end
+
+    alt Invalid Signature
+        JS-->>JF: throw SignatureException
+        JF-->>C: 401 "Invalid JWT signature"
+    end
+```
+
+---
+
+### 5. Error Handling Flow
+
+```mermaid
+graph TD
+    A["Exception Thrown"] --> B{Exception Type?}
+    
+    B -->|JwtValidationException| C["401 Unauthorized<br/>JWT-specific error message"]
+    B -->|BadCredentialsException| D["401 Unauthorized<br/>Invalid username or password"]
+    B -->|AccessDeniedException| E["403 Forbidden<br/>Insufficient permissions"]
+    B -->|MethodArgumentNotValidException| F["400 Bad Request<br/>Validation errors listed"]
+    B -->|IllegalArgumentException| G["400 Bad Request<br/>e.g. Email already registered"]
+    B -->|Any other Exception| H["500 Internal Server Error<br/>Unexpected error"]
+```
+
+All errors return a standardized `ErrorResponse` with: `status`, `error`, `message`, `details`, `path`.
+
+---
+
+## JWT Token Structure
+
+| Claim | Description | Example |
+|-------|-------------|---------|
+| `role` | User's role | `ROLE_USER` |
+| `email` | User's email | `user@example.com` |
+| `iat` | Issued at | Unix timestamp |
+| `exp` | Expiration (24h default) | Unix timestamp |
+| `jti` | Unique token ID | UUID |
+
+> [!NOTE]
+> The JWT does **not** set a `subject` claim. `extractUserId()` in `JwtService` calls `getSubject()` which will return `null`. The user is identified by the `email` claim instead.
+
+---
+
+## Security Configuration
+
+| Rule | Configuration |
+|------|---------------|
+| CSRF | Disabled (intended, but **bug**: missing `@Bean`) |
+| CORS | Disabled in Security + separate `CorsConfig` bean |
+| Session | Stateless (`STATELESS`) |
+| Public paths | `/api/auth/**`, `/error` |
+| All other paths | Require authentication |
+| Auth method | JWT via `JwtAuthenticationFilter` |
+| Password encoding | BCrypt |
+
+---
+
+## ⚠️ Known Bug
+
+> [!CAUTION]
+> The `securityFilterChain()` method in [SecurityConfig.java](file:///Users/jai/Documents/FlowSync_microservices/authService/src/main/java/com/flowsync/authService/config/SecurityConfig.java#L40) is **missing the `@Bean` annotation**. This means Spring ignores the entire custom security configuration and uses default Spring Security — which has **CSRF enabled**, causing the 403 error on POST requests. Additionally, `.csrf()` and `.formLogin()` are each called twice (duplicates).
+
+---
+
+## Inter-Service Communication
+
+```mermaid
+graph LR
+    AS["Auth Service :8083"] -->|"POST /users/internal<br/>CreateUserProfileRequest"| US["User Service :8082"]
+    US -->|"UserResponse"| AS
+```
+
+During **registration only**, the auth service calls the User Service via `RestTemplate` to create a user profile. This is a synchronous, blocking HTTP call.
+
+---
+
+## Database Schema
+
+**Table**: `auth_users`
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| `id` | UUID | PK |
+| `email` | VARCHAR | UNIQUE, NOT NULL |
+| `password` | VARCHAR | NOT NULL (BCrypt hash) |
+| `role` | VARCHAR | NOT NULL (ENUM: `ROLE_USER`, `ROLE_MANAGER`, `ROLE_ADMIN`) |
+| `created_at` | TIMESTAMP | NOT NULL |
+| `updated_at` | TIMESTAMP | |
+| `last_login` | TIMESTAMP | |
+| `is_active` | BOOLEAN | |
+
+Database: **PostgreSQL** on port `5433`, database name `FlowSync-AuthService`.
